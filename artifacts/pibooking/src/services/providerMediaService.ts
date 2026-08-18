@@ -23,6 +23,7 @@ export interface UploadMediaOptions {
 
 /**
  * Validates file format and size for provider uploads.
+ * Supported: PNG, JPG, JPEG, WebP. Maximum size: 2 MB.
  */
 export function validateMediaFile(file: File): MediaValidationResult {
   if (!file) {
@@ -42,7 +43,7 @@ export function validateMediaFile(file: File): MediaValidationResult {
   if (!isValidType) {
     return {
       valid: false,
-      error: 'Unsupported format. Please select a PNG, JPG, or WebP image.',
+      error: 'Unsupported image format. Please select a PNG, JPG, or WebP file.',
     };
   }
 
@@ -50,7 +51,7 @@ export function validateMediaFile(file: File): MediaValidationResult {
     const sizeInMb = (file.size / (1024 * 1024)).toFixed(2);
     return {
       valid: false,
-      error: `File size (${sizeInMb} MB) exceeds the 2 MB limit.`,
+      error: `File size (${sizeInMb} MB) exceeds the maximum 2 MB limit.`,
     };
   }
 
@@ -58,7 +59,7 @@ export function validateMediaFile(file: File): MediaValidationResult {
 }
 
 /**
- * Converts a File to a local base64 Data URL (fallback for offline/preview).
+ * Converts a File to a local base64 Data URL (for offline preview when unconfigured).
  */
 export function fileToDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -88,7 +89,7 @@ export function getMediaUrl(pathOrUrl: string | undefined | null): string {
   const trimmed = pathOrUrl.trim();
   if (!trimmed) return '';
 
-  // Already a full or blob URL
+  // Already a full or blob / data URL
   if (
     trimmed.startsWith('http://') ||
     trimmed.startsWith('https://') ||
@@ -98,7 +99,7 @@ export function getMediaUrl(pathOrUrl: string | undefined | null): string {
     return trimmed;
   }
 
-  // Handle storage relative paths
+  // Handle storage relative paths from w3c-assets bucket
   let cleanPath = trimmed.replace(/^\/+/, '');
   if (cleanPath.startsWith(`${W3C_ASSETS_BUCKET}/`)) {
     cleanPath = cleanPath.replace(`${W3C_ASSETS_BUCKET}/`, '');
@@ -141,8 +142,13 @@ export const providerMediaService = {
   },
 
   /**
-   * Internal dispatcher trying Edge Function 'provider-media' first,
-   * then direct Supabase Storage, and fallback to local preview data.
+   * Secure Media Upload Handler
+   *
+   * Architecture:
+   * Provider -> Existing Pi authentication -> provider-media Supabase Edge Function
+   * -> server-side authorization & validation -> Supabase Storage (w3c-assets)
+   *
+   * Direct client-to-storage bypass has been removed for security.
    */
   async uploadMedia(
     file: File,
@@ -157,82 +163,56 @@ export const providerMediaService = {
     const cleanProvider = sanitizeIdentifier(options.providerIdentifier);
     const sanitizedFilename = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
     const timestamp = Date.now();
-    const storagePath = `providers/${cleanProvider}/${type}/${timestamp}_${sanitizedFilename}`;
+    const expectedStoragePath = `providers/${cleanProvider}/${type}/${timestamp}_${sanitizedFilename}`;
 
-    // 1. Try Supabase Edge Function 'provider-media' if Supabase is configured
+    // 1. Production Flow: Invoke provider-media Supabase Edge Function
     if (isSupabaseConfigured()) {
-      try {
-        console.log(`[provider-media] Invoking Edge Function for type="${type}"...`);
+      console.log(`[provider-media] Invoking Edge Function for type="${type}" provider="${cleanProvider}"...`);
 
-        const formData = new FormData();
-        formData.append('file', file);
-        formData.append('type', type);
-        formData.append('provider', cleanProvider);
-        formData.append('providerId', cleanProvider);
-        if (options.caption) {
-          formData.append('caption', options.caption);
-        }
-
-        const headers: Record<string, string> = {};
-        if (options.piAccessToken) {
-          headers['x-pi-access-token'] = options.piAccessToken;
-          headers['Authorization'] = `Bearer ${options.piAccessToken}`;
-        }
-
-        const { data, error } = await supabase.functions.invoke('provider-media', {
-          body: formData,
-          headers,
-        });
-
-        if (!error && data) {
-          console.log('[provider-media] Edge Function upload successful:', data);
-          const returnedPath = data.path || data.storagePath || data.key || storagePath;
-          const returnedUrl = data.publicUrl || data.url || getMediaUrl(returnedPath);
-          return {
-            path: returnedPath,
-            publicUrl: returnedUrl,
-            caption: options.caption,
-          };
-        } else if (error) {
-          console.warn('[provider-media] Edge Function returned error, falling back to direct storage:', error.message);
-        }
-      } catch (err: any) {
-        console.warn('[provider-media] Edge Function exception, falling back to direct storage:', err?.message || err);
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('type', type);
+      formData.append('provider', cleanProvider);
+      formData.append('providerId', cleanProvider);
+      if (options.caption) {
+        formData.append('caption', options.caption);
       }
 
-      // 2. Direct Supabase Storage fallback to 'w3c-assets' bucket
-      try {
-        console.log(`[Supabase Storage] Uploading directly to bucket="${W3C_ASSETS_BUCKET}" path="${storagePath}"...`);
-
-        const { data, error } = await supabase.storage
-          .from(W3C_ASSETS_BUCKET)
-          .upload(storagePath, file, {
-            upsert: true,
-            contentType: file.type || 'image/jpeg',
-          });
-
-        if (!error && data) {
-          const { data: pubData } = supabase.storage.from(W3C_ASSETS_BUCKET).getPublicUrl(storagePath);
-          const publicUrl = pubData?.publicUrl || storagePath;
-          console.log('[Supabase Storage] Direct upload successful:', publicUrl);
-          return {
-            path: storagePath,
-            publicUrl,
-            caption: options.caption,
-          };
-        } else if (error) {
-          console.warn('[Supabase Storage] Direct upload error:', error.message);
-        }
-      } catch (storageErr: any) {
-        console.warn('[Supabase Storage] Exception during direct upload:', storageErr?.message || storageErr);
+      const headers: Record<string, string> = {};
+      if (options.piAccessToken) {
+        headers['x-pi-access-token'] = options.piAccessToken;
+        headers['Authorization'] = `Bearer ${options.piAccessToken}`;
       }
+
+      const { data, error } = await supabase.functions.invoke('provider-media', {
+        body: formData,
+        headers,
+      });
+
+      if (error) {
+        console.error('[provider-media] Edge Function upload failed:', error.message);
+        throw new Error(`Media upload failed: ${error.message || 'Server error'}`);
+      }
+
+      if (data) {
+        console.log('[provider-media] Edge Function upload success:', data);
+        const returnedPath = data.path || data.storagePath || data.key || expectedStoragePath;
+        const returnedUrl = data.publicUrl || data.url || getMediaUrl(returnedPath);
+        return {
+          path: returnedPath,
+          publicUrl: returnedUrl,
+          caption: options.caption,
+        };
+      }
+
+      throw new Error('Upload failed: Empty response from provider-media service.');
     }
 
-    // 3. Client Local Preview Fallback (when offline or unconfigured)
-    console.log('[provider-media] Generating local data URL preview...');
+    // 2. Offline / unconfigured development environment local preview
+    console.log('[provider-media] Supabase not configured in development, using local data URL preview.');
     const localDataUrl = await fileToDataUrl(file);
     return {
-      path: storagePath,
+      path: expectedStoragePath,
       publicUrl: localDataUrl,
       caption: options.caption,
     };

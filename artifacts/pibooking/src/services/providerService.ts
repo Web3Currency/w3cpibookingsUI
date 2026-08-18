@@ -1,6 +1,5 @@
 import { Provider, PortfolioItem } from '../types';
 import { supabase, isSupabaseConfigured, safeSupabaseInsert, safeSupabaseUpdate } from '../lib/supabase';
-import { storageService } from './storageService';
 import { providerMediaService } from './providerMediaService';
 
 const LOCAL_PROVIDERS_KEY = 'w3c_providers';
@@ -291,9 +290,8 @@ export const providerService = {
       });
       return result.path || result.publicUrl;
     } catch (err) {
-      console.warn('[providerService] providerMediaService upload failed, trying storageService:', err);
-      const customPath = `${providerId}/${Date.now()}_${file.name}`;
-      return await storageService.uploadFile('providerPhotos', customPath, file);
+      console.error('[providerService] providerMediaService upload failed:', err);
+      throw err;
     }
   }
 };
